@@ -15,6 +15,7 @@ import time         # Para operações com tempo
 import gpu          # Simula os recursos de uma GPU
 import math         # Funções matemáticas
 import numpy as np  # Biblioteca do Numpy
+from utils.py import *
 
 class GL:
     """Classe que representa a biblioteca gráfica (Graphics Library)."""
@@ -81,20 +82,14 @@ class GL:
 
     @staticmethod
     def triangleSet2D(vertices, colors):
-        """Função usada para renderizar TriangleSet2D."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry2D.html#TriangleSet2D
-        # Nessa função você receberá os vertices de um triângulo no parâmetro vertices,
-        # esses pontos são uma lista de pontos x, y sempre na ordem. Assim point[0] é o
-        # valor da coordenada x do primeiro ponto, point[1] o valor y do primeiro ponto.
-        # Já point[2] é a coordenada x do segundo ponto e assim por diante. Assuma que a
-        # quantidade de pontos é sempre multiplo de 3, ou seja, 6 valores ou 12 valores, etc.
-        # O parâmetro colors é um dicionário com os tipos cores possíveis, para o TriangleSet2D
-        # você pode assumir inicialmente o desenho das linhas com a cor emissiva (emissiveColor).
-        print("TriangleSet2D : vertices = {0}".format(vertices)) # imprime no terminal
-        print("TriangleSet2D : colors = {0}".format(colors)) # imprime no terminal as cores
-
-        # Exemplo:
-        gpu.GPU.draw_pixel([6, 8], gpu.GPU.RGB8, [255, 255, 0])  # altera pixel (u, v, tipo, r, g, b)
+        xmin = min(vertices[0][0], vertices[1][0],vertices[2][0])
+        xmax = max(vertices[0][0], vertices[1][0],vertices[2][0])
+        ymin = min(vertices[0][1], vertices[1][1],vertices[2][1])
+        ymax = max(vertices[0][1], vertices[1][1],vertices[2][1])
+        for x in range(int(xmin), int(xmax)):
+            for y in range(int(ymin), int(ymax)):
+                if inside(vertices, (x, y)):
+                    polypoint2D((x,y), colors)
 
 
     @staticmethod
