@@ -15,7 +15,7 @@ import time         # Para operações com tempo
 import gpu          # Simula os recursos de uma GPU
 import math         # Funções matemáticas
 import numpy as np  # Biblioteca do Numpy
-from utils.py import *
+from utils import *
 
 class GL:
     """Classe que representa a biblioteca gráfica (Graphics Library)."""
@@ -36,30 +36,26 @@ class GL:
     @staticmethod
     def polypoint2D(point, colors):
         """Função usada para renderizar Polypoint2D."""
-        gpu.GPU.draw_pixel(point, gpu.GPU.RGB8, colors)
-        
+        emissive = colors.get("emissiveColor", [1, 1, 1])
+        rgb = [int(round(c * 255)) for c in emissive]
+
+        for i in range(0, len(point), 2):
+            x = int(round(point[i]))
+            y = int(round(point[i + 1]))
+            if 0 <= x < GL.width and 0 <= y < GL.height:
+                gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, rgb)
+
     @staticmethod
     def polyline2D(lineSegments, colors):
         """Função usada para renderizar Polyline2D."""
-        # https://www.web3d.org/specifications/X3Dv4/ISO-IEC19775-1v4-IS/Part01/components/geometry2D.html#Polyline2D
-        # Nessa função você receberá os pontos de uma linha no parâmetro lineSegments, esses
-        # pontos são uma lista de pontos x, y sempre na ordem. Assim point[0] é o valor da
-        # coordenada x do primeiro ponto, point[1] o valor y do primeiro ponto. Já point[2] é
-        # a coordenada x do segundo ponto e assim por diante. Assuma a quantidade de pontos
-        # pelo tamanho da lista. A quantidade mínima de pontos são 2 (4 valores), porém a
-        # função pode receber mais pontos para desenhar vários segmentos. Assuma que sempre
-        # vira uma quantidade par de valores.
-        # O parâmetro colors é um dicionário com os tipos cores possíveis, para o Polyline2D
-        # você pode assumir inicialmente o desenho das linhas com a cor emissiva (emissiveColor).
+        emissive = colors.get("emissiveColor", [1, 1, 1])
+        rgb = [int(round(c * 255)) for c in emissive]
 
-        print("Polyline2D : lineSegments = {0}".format(lineSegments)) # imprime no terminal
-        print("Polyline2D : colors = {0}".format(colors)) # imprime no terminal as cores
-        
-        # Exemplo:
-        pos_x = GL.width//2
-        pos_y = GL.height//2
-        gpu.GPU.draw_pixel([pos_x, pos_y], gpu.GPU.RGB8, [255, 0, 255])  # altera pixel (u, v, tipo, r, g, b)
-        # cuidado com as cores, o X3D especifica de (0,1) e o Framebuffer de (0,255)
+        pts = [(lineSegments[i], lineSegments[i + 1])
+            for i in range(0, len(lineSegments), 2)]
+
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            draw_line(x0, y0, x1, y1, rgb)
 
     @staticmethod
     def circle2D(radius, colors):
@@ -82,14 +78,33 @@ class GL:
 
     @staticmethod
     def triangleSet2D(vertices, colors):
-        xmin = min(vertices[0][0], vertices[1][0],vertices[2][0])
-        xmax = max(vertices[0][0], vertices[1][0],vertices[2][0])
-        ymin = min(vertices[0][1], vertices[1][1],vertices[2][1])
-        ymax = max(vertices[0][1], vertices[1][1],vertices[2][1])
-        for x in range(int(xmin), int(xmax)):
-            for y in range(int(ymin), int(ymax)):
-                if inside(vertices, (x, y)):
-                    polypoint2D((x,y), colors)
+        """Função usada para renderizar TriangleSet2D."""
+        emissive = colors.get("emissiveColor", [1, 1, 1])
+        rgb = [int(round(c * 255)) for c in emissive]
+
+        def edge(ax, ay, bx, by, px, py):
+            return (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+
+        # Agrupa de 6 em 6 valores (3 vértices x, y por triângulo)
+        for t in range(0, len(vertices), 6):
+            x0, y0 = vertices[t], vertices[t + 1]
+            x1, y1 = vertices[t + 2], vertices[t + 3]
+            x2, y2 = vertices[t + 4], vertices[t + 5]
+
+            xmin = max(0, int(math.floor(min(x0, x1, x2))))
+            xmax = min(GL.width - 1, int(math.ceil(max(x0, x1, x2))))
+            ymin = max(0, int(math.floor(min(y0, y1, y2))))
+            ymax = min(GL.height - 1, int(math.ceil(max(y0, y1, y2))))
+
+            for y in range(ymin, ymax + 1):
+                for x in range(xmin, xmax + 1):
+                    px, py = x + 0.5, y + 0.5
+                    w0 = edge(x1, y1, x2, y2, px, py)
+                    w1 = edge(x2, y2, x0, y0, px, py)
+                    w2 = edge(x0, y0, x1, y1, px, py)
+                    if (w0 >= 0 and w1 >= 0 and w2 >= 0) or \
+                    (w0 <= 0 and w1 <= 0 and w2 <= 0):
+                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, rgb)
 
 
     @staticmethod

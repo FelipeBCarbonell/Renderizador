@@ -1,32 +1,27 @@
-def y_na_reta(p1, p2, x):
-    dx = p2[0] - p1[0]
-    if dx == 0:
-        return None
-    s = (p2[1] - p1[1]) / dx
-    return p1[1] + s * (x - p1[0])
+import gpu
 
-def no_intervalo_x(p1, p2, x):
-    return min(p1[0], p2[0]) <= x <= max(p1[0], p2[0])
+def draw_line(x0, y0, x1, y1, rgb):
+    """Rasteriza um segmento de reta usando o algoritmo de Bresenham."""
+    x0, y0 = int(round(x0)), int(round(y0))
+    x1, y1 = int(round(x1)), int(round(y1))
 
-def baixo(linha, ponto):
-    p1, p2 = linha
-    y_reta = y_na_reta(p1, p2, ponto[0])
-    if y_reta is None:
-        return False
-    return (ponto[1] <= y_reta and no_intervalo_x(p1, p2, ponto[0]))
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
 
-def alto(linha, ponto):
-    p1, p2 = linha
-    y_reta = y_na_reta(p1, p2, ponto[0])
-    if y_reta is None:
-        return False
-    return ponto[1] >= y_reta and no_intervalo_x(p1, p2, ponto[0])
+    from gl import GL  # import tardio evita import circular com gl.py
 
-def inside(triangulo, ponto):
-    p0, p1, p2 = triangulo
-    arestas = [(p0, p1), (p1, p2), (p2, p0)]
-
-    under = any(baixo(aresta, ponto) for aresta in arestas)
-    over = any(alto(aresta, ponto) for aresta in arestas)
-
-    return under and over
+    while True:
+        if 0 <= x0 < GL.width and 0 <= y0 < GL.height:
+            gpu.GPU.draw_pixel([x0, y0], gpu.GPU.RGB8, rgb)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
