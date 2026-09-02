@@ -25,6 +25,16 @@ class GL:
     near = 0.01   # plano de corte próximo
     far = 1000    # plano de corte distante
 
+    # Pilha de transformações do modelo. O topo (índice -1) é sempre a
+    # matriz de transformação acumulada (mundo <- objeto) válida no ponto
+    # atual do grafo de cena. Começa com a identidade.
+    transform_stack = [np.identity(4)]
+
+    # Matriz de visualização (view) e de projeção perspectiva, calculadas
+    # em viewpoint(). Começam como identidade até que um Viewpoint seja lido.
+    view_matrix = np.identity(4)
+    perspective_matrix = np.identity(4)
+
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
         """Definr parametros para câmera de razão de aspecto, plano próximo e distante."""
@@ -32,6 +42,98 @@ class GL:
         GL.height = height
         GL.near = near
         GL.far = far
+
+    # ------------------------------------------------------------------
+    # Utilitários de matrizes (transformações geométricas em coordenadas
+    # homogêneas, vetores coluna: p' = M @ p)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _translation_matrix(t):
+        """Monta a matriz 4x4 de translação a partir de [x, y, z]."""
+        return np.array([
+            [1, 0, 0, t[0]],
+            [0, 1, 0, t[1]],
+            [0, 0, 1, t[2]],
+            [0, 0, 0, 1]
+        ], dtype=float)
+
+    @staticmethod
+    def _scale_matrix(s):
+        """Monta a matriz 4x4 de escala a partir de [sx, sy, sz]."""
+        return np.array([
+            [s[0], 0, 0, 0],
+            [0, s[1], 0, 0],
+            [0, 0, s[2], 0],
+            [0, 0, 0, 1]
+        ], dtype=float)
+
+    @staticmethod
+    def _rotation_matrix(r):
+        """Monta a matriz 4x4 de rotação a partir de [x, y, z, angulo]
+        (rotação ao redor do eixo (x, y, z) por 'angulo' radianos, regra
+        da mão direita), usando a fórmula de Rodrigues."""
+        x, y, z, angle = r
+        norm = math.sqrt(x * x + y * y + z * z)
+        if norm < 1e-8:
+            return np.identity(4)
+        x, y, z = x / norm, y / norm, z / norm
+        c = math.cos(angle)
+        s = math.sin(angle)
+        t = 1 - c
+        return np.array([
+            [t * x * x + c,     t * x * y - s * z, t * x * z + s * y, 0],
+            [t * x * y + s * z, t * y * y + c,     t * y * z - s * x, 0],
+            [t * x * z - s * y, t * y * z + s * x, t * z * z + c,     0],
+            [0, 0, 0, 1]
+        ], dtype=float)
+
+    @staticmethod
+    def _screen_matrix():
+        """Matriz que leva coordenadas normalizadas (NDC, [-1, 1]) para
+        coordenadas de tela em pixels (origem no canto superior esquerdo)."""
+        return np.array([
+            [GL.width / 2, 0, 0, GL.width / 2],
+            [0, -GL.height / 2, 0, GL.height / 2],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=float)
+
+    @staticmethod
+    def _project_vertex(x, y, z, mvp):
+        """Aplica a matriz Model-View-Projection a um vértice e retorna as
+        coordenadas de tela (x, y) já com a divisão perspectiva feita,
+        ou None se o ponto não puder ser projetado (w muito próximo de 0)."""
+        clip = mvp @ np.array([x, y, z, 1.0])
+        w = clip[3]
+        if abs(w) < 1e-8:
+            return None
+        ndc = clip[:3] / w
+        screen = GL._screen_matrix() @ np.array([ndc[0], ndc[1], ndc[2], 1.0])
+        return screen[0], screen[1]
+
+    @staticmethod
+    def _rasterize_triangle(x0, y0, x1, y1, x2, y2, rgb):
+        """Preenche um triângulo em coordenadas de tela usando funções de
+        aresta (mesma técnica usada em triangleSet2D)."""
+
+        def edge(ax, ay, bx, by, px, py):
+            return (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+
+        xmin = max(0, int(math.floor(min(x0, x1, x2))))
+        xmax = min(GL.width - 1, int(math.ceil(max(x0, x1, x2))))
+        ymin = max(0, int(math.floor(min(y0, y1, y2))))
+        ymax = min(GL.height - 1, int(math.ceil(max(y0, y1, y2))))
+
+        for y in range(ymin, ymax + 1):
+            for x in range(xmin, xmax + 1):
+                px, py = x + 0.5, y + 0.5
+                w0 = edge(x1, y1, x2, y2, px, py)
+                w1 = edge(x2, y2, x0, y0, px, py)
+                w2 = edge(x0, y0, x1, y1, px, py)
+                if (w0 >= 0 and w1 >= 0 and w2 >= 0) or \
+                   (w0 <= 0 and w1 <= 0 and w2 <= 0):
+                    gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, rgb)
 
     @staticmethod
     def polypoint2D(point, colors):
@@ -82,29 +184,12 @@ class GL:
         emissive = colors.get("emissiveColor", [1, 1, 1])
         rgb = [int(round(c * 255)) for c in emissive]
 
-        def edge(ax, ay, bx, by, px, py):
-            return (px - ax) * (by - ay) - (py - ay) * (bx - ax)
-
         # Agrupa de 6 em 6 valores (3 vértices x, y por triângulo)
         for t in range(0, len(vertices), 6):
             x0, y0 = vertices[t], vertices[t + 1]
             x1, y1 = vertices[t + 2], vertices[t + 3]
             x2, y2 = vertices[t + 4], vertices[t + 5]
-
-            xmin = max(0, int(math.floor(min(x0, x1, x2))))
-            xmax = min(GL.width - 1, int(math.ceil(max(x0, x1, x2))))
-            ymin = max(0, int(math.floor(min(y0, y1, y2))))
-            ymax = min(GL.height - 1, int(math.ceil(max(y0, y1, y2))))
-
-            for y in range(ymin, ymax + 1):
-                for x in range(xmin, xmax + 1):
-                    px, py = x + 0.5, y + 0.5
-                    w0 = edge(x1, y1, x2, y2, px, py)
-                    w1 = edge(x2, y2, x0, y0, px, py)
-                    w2 = edge(x0, y0, x1, y1, px, py)
-                    if (w0 >= 0 and w1 >= 0 and w2 >= 0) or \
-                    (w0 <= 0 and w1 <= 0 and w2 <= 0):
-                        gpu.GPU.draw_pixel([x, y], gpu.GPU.RGB8, rgb)
+            GL._rasterize_triangle(x0, y0, x1, y1, x2, y2, rgb)
 
 
     @staticmethod
@@ -124,12 +209,31 @@ class GL:
         # (emissiveColor), conforme implementar novos materias você deverá suportar outros
         # tipos de cores.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleSet : pontos = {0}".format(point)) # imprime no terminal pontos
-        print("TriangleSet : colors = {0}".format(colors)) # imprime no terminal as cores
+        emissive = colors.get("emissiveColor", [1, 1, 1])
+        rgb = [int(round(c * 255)) for c in emissive]
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        # Matriz Model-View-Projection: leva pontos do espaço do objeto
+        # (local) até o espaço de recorte (clip space). A divisão perspectiva
+        # e o mapeamento para tela são feitos depois, ponto a ponto, em
+        # _project_vertex, pois a divisão por w não é uma operação linear.
+        model_matrix = GL.transform_stack[-1]
+        mvp = GL.perspective_matrix @ GL.view_matrix @ model_matrix
+
+        # Agrupa de 9 em 9 valores (3 vértices x, y, z por triângulo)
+        for t in range(0, len(point), 9):
+            projected = []
+            for i in range(3):
+                x = point[t + i * 3]
+                y = point[t + i * 3 + 1]
+                z = point[t + i * 3 + 2]
+                p = GL._project_vertex(x, y, z, mvp)
+                projected.append(p)
+
+            if any(p is None for p in projected):
+                continue
+
+            (x0, y0), (x1, y1), (x2, y2) = projected
+            GL._rasterize_triangle(x0, y0, x1, y1, x2, y2, rgb)
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
@@ -138,11 +242,29 @@ class GL:
         # câmera virtual. Use esses dados para poder calcular e criar a matriz de projeção
         # perspectiva para poder aplicar nos pontos dos objetos geométricos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Viewpoint : ", end='')
-        print("position = {0} ".format(position), end='')
-        print("orientation = {0} ".format(orientation), end='')
-        print("fieldOfView = {0} ".format(fieldOfView))
+        # Matriz que leva a câmera da origem/orientação padrão até sua pose
+        # no mundo (posição + orientação). A view matrix é o inverso disso,
+        # pois transformamos o mundo para o espaço da câmera.
+        camera_matrix = GL._translation_matrix(position) @ GL._rotation_matrix(orientation)
+        GL.view_matrix = np.linalg.inv(camera_matrix)
+
+        # fieldOfView do X3D é o menor entre o campo de visão horizontal e
+        # vertical, dependendo da razão de aspecto. Convertendo para fovy:
+        aspect = GL.width / GL.height
+        fovy = fieldOfView
+        if aspect > 1:
+            fovy = 2 * math.atan(math.tan(fieldOfView / 2) / aspect)
+
+        top = GL.near * math.tan(fovy / 2)
+        right = top * aspect
+
+        GL.perspective_matrix = np.array([
+            [GL.near / right, 0, 0, 0],
+            [0, GL.near / top, 0, 0],
+            [0, 0, -(GL.far + GL.near) / (GL.far - GL.near),
+             -2 * GL.far * GL.near / (GL.far - GL.near)],
+            [0, 0, -1, 0]
+        ], dtype=float)
 
     @staticmethod
     def transform_in(translation, scale, rotation):
@@ -158,15 +280,16 @@ class GL:
         # Quando começar a usar Transforms dentre de outros Transforms, mais a frente no curso
         # Você precisará usar alguma estrutura de dados pilha para organizar as matrizes.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Transform : ", end='')
-        if translation:
-            print("translation = {0} ".format(translation), end='') # imprime no terminal
-        if scale:
-            print("scale = {0} ".format(scale), end='') # imprime no terminal
-        if rotation:
-            print("rotation = {0} ".format(rotation), end='') # imprime no terminal
-        print("")
+        T = GL._translation_matrix(translation) if translation else np.identity(4)
+        R = GL._rotation_matrix(rotation) if rotation else np.identity(4)
+        S = GL._scale_matrix(scale) if scale else np.identity(4)
+
+        # Ordem padrão X3D: escala, depois rotação, depois translação
+        # (aplicada da direita para a esquerda sobre o ponto).
+        local_matrix = T @ R @ S
+
+        parent_matrix = GL.transform_stack[-1]
+        GL.transform_stack.append(parent_matrix @ local_matrix)
 
     @staticmethod
     def transform_out():
@@ -176,8 +299,8 @@ class GL:
         # deverá recuperar a matriz de transformação dos modelos do mundo da estrutura de
         # pilha implementada.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Saindo de Transform")
+        if len(GL.transform_stack) > 1:
+            GL.transform_stack.pop()
 
     @staticmethod
     def triangleStripSet(point, stripCount, colors):
