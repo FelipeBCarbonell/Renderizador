@@ -113,6 +113,22 @@ class GL:
         return screen[0], screen[1]
 
     @staticmethod
+    def _get_point3d(coord, idx):
+        """Extrai o vértice (x, y, z) de índice `idx` de uma lista plana de
+        coordenadas [x0, y0, z0, x1, y1, z1, ...]."""
+        return coord[idx * 3], coord[idx * 3 + 1], coord[idx * 3 + 2]
+
+    @staticmethod
+    def _draw_triangle_3d(p0, p1, p2, mvp, rgb):
+        """Projeta três vértices (x, y, z) do espaço do objeto para a tela
+        usando a matriz `mvp` e rasteriza o triângulo resultante."""
+        proj = [GL._project_vertex(x, y, z, mvp) for (x, y, z) in (p0, p1, p2)]
+        if any(p is None for p in proj):
+            return
+        (x0, y0), (x1, y1), (x2, y2) = proj
+        GL._rasterize_triangle(x0, y0, x1, y1, x2, y2, rgb)
+
+    @staticmethod
     def _rasterize_triangle(x0, y0, x1, y1, x2, y2, rgb):
         """Preenche um triângulo em coordenadas de tela usando funções de
         aresta (mesma técnica usada em triangleSet2D)."""
@@ -317,15 +333,24 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TriangleStripSet : pontos = {0} ".format(point), end='')
-        for i, strip in enumerate(stripCount):
-            print("strip[{0}] = {1} ".format(i, strip), end='')
-        print("")
-        print("TriangleStripSet : colors = {0}".format(colors)) # imprime no terminal as cores
+        emissive = colors.get("emissiveColor", [1, 1, 1])
+        rgb = [int(round(c * 255)) for c in emissive]
+        mvp = GL.perspective_matrix @ GL.view_matrix @ GL.transform_stack[-1]
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        offset = 0
+        for count in stripCount:
+            for j in range(count - 2):
+                p0 = GL._get_point3d(point, offset + j)
+                p1 = GL._get_point3d(point, offset + j + 1)
+                p2 = GL._get_point3d(point, offset + j + 2)
+                # Tiras de triângulo alternam a orientação dos vértices a
+                # cada triângulo para manter a face consistente (sentido
+                # horário/anti-horário) ao longo da tira.
+                if j % 2 == 0:
+                    GL._draw_triangle_3d(p0, p1, p2, mvp, rgb)
+                else:
+                    GL._draw_triangle_3d(p1, p0, p2, mvp, rgb)
+            offset += count
 
     @staticmethod
     def indexedTriangleStripSet(point, index, colors):
@@ -343,12 +368,26 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedTriangleStripSet : pontos = {0}, index = {1}".format(point, index))
-        print("IndexedTriangleStripSet : colors = {0}".format(colors)) # imprime as cores
+        emissive = colors.get("emissiveColor", [1, 1, 1])
+        rgb = [int(round(c * 255)) for c in emissive]
+        mvp = GL.perspective_matrix @ GL.view_matrix @ GL.transform_stack[-1]
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        strip = []
+        for idx in index:
+            if idx == -1:
+                # -1 marca o fim de uma tira; a próxima tira recomeça do zero
+                strip = []
+                continue
+            strip.append(idx)
+            if len(strip) >= 3:
+                j = len(strip) - 3
+                p0 = GL._get_point3d(point, strip[j])
+                p1 = GL._get_point3d(point, strip[j + 1])
+                p2 = GL._get_point3d(point, strip[j + 2])
+                if j % 2 == 0:
+                    GL._draw_triangle_3d(p0, p1, p2, mvp, rgb)
+                else:
+                    GL._draw_triangle_3d(p1, p0, p2, mvp, rgb)
 
     @staticmethod
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
@@ -375,23 +414,34 @@ class GL:
         # cor da textura conforme a posição do mapeamento. Dentro da classe GPU já está
         # implementadado um método para a leitura de imagens.
 
-        # Os prints abaixo são só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("IndexedFaceSet : ")
-        if coord:
-            print("\tpontos(x, y, z) = {0}, coordIndex = {1}".format(coord, coordIndex))
-        print("colorPerVertex = {0}".format(colorPerVertex))
-        if colorPerVertex and color and colorIndex:
-            print("\tcores(r, g, b) = {0}, colorIndex = {1}".format(color, colorIndex))
-        if texCoord and texCoordIndex:
-            print("\tpontos(u, v) = {0}, texCoordIndex = {1}".format(texCoord, texCoordIndex))
-        if current_texture:
-            image = gpu.GPU.load_texture(current_texture[0])
-            print("\t Matriz com image = {0}".format(image))
-            print("\t Dimensões da image = {0}".format(image.shape))
-        print("IndexedFaceSet : colors = {0}".format(colors))  # imprime no terminal as cores
+        # NOTA: cor por vértice (colorPerVertex) e textura (current_texture)
+        # ainda não são tratadas aqui — por enquanto todo o polígono é
+        # pintado com a cor emissiva, que já é suficiente para os exemplos
+        # desta entrega (a interpolação baricêntrica de cor/textura fica
+        # como próximo passo).
+        emissive = colors.get("emissiveColor", [1, 1, 1])
+        rgb = [int(round(c * 255)) for c in emissive]
+        mvp = GL.perspective_matrix @ GL.view_matrix @ GL.transform_stack[-1]
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        def draw_face(face):
+            # Triangulação em leque a partir do primeiro vértice da face.
+            if len(face) < 3:
+                return
+            v0 = GL._get_point3d(coord, face[0])
+            for k in range(1, len(face) - 1):
+                v1 = GL._get_point3d(coord, face[k])
+                v2 = GL._get_point3d(coord, face[k + 1])
+                GL._draw_triangle_3d(v0, v1, v2, mvp, rgb)
+
+        face = []
+        for idx in coordIndex:
+            if idx == -1:
+                # -1 marca o fim de uma face
+                draw_face(face)
+                face = []
+                continue
+            face.append(idx)
+        draw_face(face)  # segurança, caso a lista não termine com -1
 
     @staticmethod
     def box(size, colors):
