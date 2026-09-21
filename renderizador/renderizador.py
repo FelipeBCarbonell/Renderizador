@@ -101,6 +101,9 @@ class Renderizador:
         # Limpa o frame buffers atual
         gpu.GPU.clear_buffer()
 
+        # Prepara buffers superamostrados (anti-aliasing) e z-buffer do quadro
+        gl.GL.begin_frame()
+
         # Recursos que podem ser úteis:
         # Define o valor do pixel no framebuffer: draw_pixel(coord, mode, data)
         # Retorna o valor do pixel no framebuffer: read_pixel(coord, mode)
@@ -112,6 +115,9 @@ class Renderizador:
         # Essa é uma chamada conveniente para manipulação de buffers
         # ao final da renderização de um frame. Como por exemplo, executar
         # downscaling da imagem.
+
+        # Reduz a imagem superamostrada para a resolução final
+        gl.GL.end_frame()
 
         # Método para a troca dos buffers (NÃO IMPLEMENTADO)
         # Esse método será utilizado na fase de implementação de animações

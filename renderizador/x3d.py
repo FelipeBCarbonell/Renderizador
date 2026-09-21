@@ -577,6 +577,7 @@ class Shape(X3DShapeNode):
 
     def render(self):
         """Rotina de renderização."""
+        X3D.current_texture = []  # textura vale só para o Shape atual
         if self.appearance:
             self.appearance.render()
         if self.geometry:
