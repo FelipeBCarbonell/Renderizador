@@ -46,6 +46,18 @@ class GL:
 
     _mip_cache = {}     # pirâmides de mipmap por textura
 
+    # Iluminação: luzes coletadas em cada quadro e dados da câmera
+    _lights = []                # DirectionalLight/PointLight lidas neste quadro
+    _headlight = False          # luz da câmera (NavigationInfo headlight)
+    _eye = np.zeros(3)          # posição da câmera no mundo
+    _cam_rot = np.identity(3)   # orientação da câmera (3x3)
+
+    # Em tiras de triângulos as normais são suavizadas entre faces vizinhas
+    # (vértices compartilhados). Use False para sombreamento facetado.
+    smooth_strips = True
+
+    _timers = {}                # instante de início de cada TimeSensor
+
     @staticmethod
     def setup(width, height, near=0.01, far=1000):
         """Definr parametros para câmera de razão de aspecto, plano próximo e distante."""
@@ -53,6 +65,7 @@ class GL:
         GL.height = height
         GL.near = near
         GL.far = far
+        GL._timers = {}
 
     # ------------------------------------------------------------------
     # Utilitários de matrizes (transformações geométricas em coordenadas
@@ -101,16 +114,117 @@ class GL:
 
     @staticmethod
     def _material(colors):
-        """Extrai (cor emissiva em 0-255, transparência) do dicionário de cores."""
-        emissive = colors.get("emissiveColor", [1, 1, 1])
-        rgb = np.array([c * 255 for c in emissive], dtype=float)
-        return rgb, float(colors.get("transparency", 0.0))
+        """Reúne as propriedades do material. Cores em 0-1, exceto a emissiva
+        (0-255). 'lit' é falso quando o Shape não tem nó Material: nesse caso
+        não há iluminação e a cor vem da textura/cores por vértice (ou branco)."""
+        lit = bool(colors.get("material", True))
+        emissive = np.array(colors.get("emissiveColor", [1, 1, 1]), dtype=float)
+        if not lit:
+            emissive = np.ones(3)
+        return {
+            "lit": lit,
+            "emissive": emissive * 255,
+            "diffuse": np.array(colors.get("diffuseColor", [0.8, 0.8, 0.8]), dtype=float),
+            "specular": np.array(colors.get("specularColor", [0, 0, 0]), dtype=float),
+            "shininess": float(colors.get("shininess", 0.2)),
+            "ambient": float(colors.get("ambientIntensity", 0.2)),
+            "transparency": float(colors.get("transparency", 0.0)),
+        }
 
     @staticmethod
     def _get_point3d(coord, idx):
         """Extrai o vértice (x, y, z) de índice `idx` de uma lista plana de
         coordenadas [x0, y0, z0, x1, y1, z1, ...]."""
         return coord[idx * 3], coord[idx * 3 + 1], coord[idx * 3 + 2]
+
+    # ------------------------------------------------------------------
+    # Iluminação (modelo do X3D: emissiva + ambiente + difusa + especular)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _active_lights():
+        """Luzes do quadro: as da cena mais a headlight (se ligada), que
+        sempre aponta para onde a câmera olha (-Z da câmera)."""
+        lights = list(GL._lights)
+        if GL._headlight:
+            lights.append({"type": "dir", "dir": GL._cam_rot @ np.array([0.0, 0.0, -1.0]),
+                           "color": np.ones(3), "intensity": 1.0, "ambient": 0.0})
+        return lights
+
+    @staticmethod
+    def _shade(P, N, base, mat):
+        """Calcula a cor (0-255) de cada fragmento.
+
+        P    : (n, 3) posições no mundo
+        N    : (n, 3) normais no mundo
+        base : (n, 3) ou (3,) cor difusa (0-1) — material, textura ou vértice
+        mat  : dicionário de _material
+
+        cor = emissiva + soma por luz de cor_da_luz * (ambiente + difusa + especular)
+          ambiente  = ambientIntensity_luz * ambientIntensity_material * base
+          difusa    = intensidade * base * (N . L)
+          especular = intensidade * specularColor * (N . H) ^ (shininess * 128)
+        """
+        n = len(P)
+        N = N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-12)
+        V = GL._eye - P
+        V = V / np.maximum(np.linalg.norm(V, axis=1, keepdims=True), 1e-12)
+        # Iluminação de dois lados: vira a normal para o lado de quem olha
+        N = np.where(((N * V).sum(axis=1) < 0)[:, None], -N, N)
+
+        out = np.tile(mat["emissive"] / 255.0, (n, 1))
+        for light in GL._active_lights():
+            if light["type"] == "dir":
+                L = -light["dir"]                    # direção PARA a luz
+            else:
+                L = light["loc"] - P
+                L = L / np.maximum(np.linalg.norm(L, axis=1, keepdims=True), 1e-12)
+            nl = np.clip((N * L).sum(axis=1), 0.0, None)
+            H = L + V
+            H = H / np.maximum(np.linalg.norm(H, axis=1, keepdims=True), 1e-12)
+            nh = np.clip((N * H).sum(axis=1), 0.0, None)
+            spec = np.where(nl > 0, nh ** (mat["shininess"] * 128.0), 0.0)
+            term = light["ambient"] * mat["ambient"] * base \
+                + light["intensity"] * (base * nl[:, None] + mat["specular"] * spec[:, None])
+            out = out + light["color"] * term
+        return np.clip(out * 255.0, 0, 255)
+
+    @staticmethod
+    def _vertex_normals(P, tris, model):
+        """Normais suaves (no mundo) por vértice: soma das normais das faces
+        que dividem o vértice (ponderada pela área) e normalização."""
+        P = np.asarray(P, dtype=float)
+        W = (model @ np.c_[P, np.ones(len(P))].T).T[:, :3]
+        t = np.asarray(tris)
+        fn = np.cross(W[t[:, 1]] - W[t[:, 0]], W[t[:, 2]] - W[t[:, 0]])
+        vn = np.zeros_like(W)
+        for k in range(3):
+            np.add.at(vn, t[:, k], fn)
+        return vn / np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
+
+    @staticmethod
+    def _draw_indexed_mesh(P, tris, mat, vnormals=None, smooth=False):
+        """Desenha uma malha de triângulos indexada (vértices P, triângulos
+        `tris`). Normais: analíticas (vnormals, no espaço do objeto), suaves
+        (smooth) ou, se nenhuma das duas, uma por face (facetado)."""
+        P = np.asarray(P, dtype=float).reshape(-1, 3)
+        if len(tris) == 0:
+            return
+        model = GL.transform_stack[-1]
+        mvp = GL.perspective_matrix @ GL.view_matrix @ model
+
+        normals = None
+        if mat["lit"]:
+            if vnormals is not None:
+                # normais se transformam pela inversa transposta do modelo
+                nm = np.linalg.pinv(model[:3, :3]).T
+                normals = (nm @ np.asarray(vnormals, dtype=float).T).T
+            elif smooth:
+                normals = GL._vertex_normals(P, tris, model)
+
+        for (a, b, c) in tris:
+            GL._draw_triangle_3d(P[a], P[b], P[c], mvp, mat, model,
+                                 None if normals is None else normals[[a, b, c]])
 
     # ------------------------------------------------------------------
     # Quadro: buffers superamostrados (anti-aliasing), z-buffer e composição
@@ -127,6 +241,7 @@ class GL:
         GL._ss_depth = np.full((h, w), np.inf)    # z-buffer (NDC, menor = mais perto)
         GL._ss_covered = np.zeros((h, w), dtype=bool)
         GL.transform_stack = [np.identity(4)]
+        GL._lights = []
 
     @staticmethod
     def end_frame():
@@ -198,7 +313,7 @@ class GL:
 
     @staticmethod
     def _fill_triangle(pts, zs, ws, color=None, vcolors=None, uvs=None,
-                       mipmaps=None, transparency=0.0, depth_test=True):
+                       mipmaps=None, transparency=0.0, depth_test=True, shade=None):
         """Rasteriza um triângulo no buffer superamostrado.
 
         pts : 3 vértices (x, y) em pixels de tela (não superamostrados)
@@ -206,6 +321,9 @@ class GL:
         ws  : w de clip de cada vértice (usado na correção de perspectiva)
         color / vcolors / uvs+mipmaps : cor sólida (0-255), cores por vértice
             (0-255) ou coordenadas de textura por vértice.
+        shade : None (sem luz) ou (W, N, mat): posições (3x3) e normais (3x3)
+            dos vértices no mundo e o material; ativa o cálculo de iluminação
+            por fragmento (a cor de vértice/textura passa a ser a cor difusa).
         """
         s = GL.supersampling
         sx = [p[0] * s for p in pts]
@@ -258,6 +376,7 @@ class GL:
             tot = np.where(np.abs(tot) < 1e-12, 1e-12, tot)
             return a0 / tot, a1 / tot, a2 / tot
 
+        weights = None
         if mipmaps is not None:
             def uv_at(px, py):
                 q = persp(px, py)
@@ -268,10 +387,25 @@ class GL:
             uy, vy = uv_at(fx, fy + 1)
             col = GL._sample_mipmaps(mipmaps, u, v, ux - u, vx - v, uy - u, vy - v)
         elif vcolors is not None:
-            p = persp(fx, fy)
+            weights = persp(fx, fy)
             vc = np.asarray(vcolors, dtype=float)
-            col = p[0][:, None] * vc[0] + p[1][:, None] * vc[1] + p[2][:, None] * vc[2]
+            col = (weights[0][:, None] * vc[0] + weights[1][:, None] * vc[1]
+                   + weights[2][:, None] * vc[2])
         else:
+            col = None  # cor sólida: definida abaixo
+
+        if shade is not None:
+            # Iluminação por fragmento: interpola posição e normal no mundo
+            W, Nv, mat = shade
+            if weights is None:
+                weights = persp(fx, fy)
+            P = (weights[0][:, None] * W[0] + weights[1][:, None] * W[1]
+                 + weights[2][:, None] * W[2])
+            N = (weights[0][:, None] * Nv[0] + weights[1][:, None] * Nv[1]
+                 + weights[2][:, None] * Nv[2])
+            base = col / 255.0 if col is not None else mat["diffuse"]
+            col = GL._shade(P, N, base, mat)
+        elif col is None:
             col = np.broadcast_to(np.asarray(color, dtype=float), (ix.size, 3))
 
         # Composição de transparência: a cor de trás pesa `transparency`
@@ -284,10 +418,12 @@ class GL:
             GL._ss_depth[iy, ix] = z  # transparentes testam, mas não escrevem profundidade
 
     @staticmethod
-    def _draw_triangle_3d(p0, p1, p2, mvp, rgb, transparency=0.0,
+    def _draw_triangle_3d(p0, p1, p2, mvp, mat, model=None, normals=None,
                           vcolors=None, uvs=None, mipmaps=None):
         """Projeta três vértices (x, y, z) do espaço do objeto com a matriz
-        `mvp`, faz a divisão perspectiva, leva à tela e rasteriza."""
+        `mvp`, faz a divisão perspectiva, leva à tela e rasteriza. Se o material
+        for iluminado, também leva os vértices ao mundo (com `model`) e calcula
+        a normal da face (ou usa `normals`, uma por vértice, já no mundo)."""
         pts, zs, ws = [], [], []
         for (x, y, z) in (p0, p1, p2):
             clip = mvp @ np.array([x, y, z, 1.0])
@@ -298,8 +434,22 @@ class GL:
             pts.append(((ndc[0] + 1) * GL.width / 2, (1 - ndc[1]) * GL.height / 2))
             zs.append(ndc[2])
             ws.append(w)
-        GL._fill_triangle(pts, zs, ws, color=rgb, vcolors=vcolors, uvs=uvs,
-                          mipmaps=mipmaps, transparency=transparency)
+
+        shade = None
+        if mat["lit"]:
+            corners = np.array([[*p0, 1.0], [*p1, 1.0], [*p2, 1.0]])
+            W = (model @ corners.T).T[:, :3]
+            if normals is None:
+                n = np.cross(W[1] - W[0], W[2] - W[0])
+                length = np.linalg.norm(n)
+                if length < 1e-12:
+                    return
+                normals = np.tile(n / length, (3, 1))
+            shade = (W, normals, mat)
+
+        GL._fill_triangle(pts, zs, ws, color=mat["emissive"], vcolors=vcolors, uvs=uvs,
+                          mipmaps=mipmaps, transparency=mat["transparency"], shade=shade)
+
     @staticmethod
     def polypoint2D(point, colors):
         """Função usada para renderizar Polypoint2D."""
@@ -375,19 +525,21 @@ class GL:
         # (emissiveColor), conforme implementar novos materias você deverá suportar outros
         # tipos de cores.
 
-        rgb, transp = GL._material(colors)
+        mat = GL._material(colors)
 
         # Matriz Model-View-Projection: leva pontos do espaço do objeto
         # (local) até o espaço de recorte (clip space). A divisão perspectiva
         # e o mapeamento para tela são feitos por vértice em _draw_triangle_3d.
-        mvp = GL.perspective_matrix @ GL.view_matrix @ GL.transform_stack[-1]
+        model = GL.transform_stack[-1]
+        mvp = GL.perspective_matrix @ GL.view_matrix @ model
 
-        # Agrupa de 9 em 9 valores (3 vértices x, y, z por triângulo)
+        # Agrupa de 9 em 9 valores (3 vértices x, y, z por triângulo). Cada
+        # triângulo é facetado (uma normal por face).
         for t in range(0, len(point) - 8, 9):
             p0 = (point[t], point[t + 1], point[t + 2])
             p1 = (point[t + 3], point[t + 4], point[t + 5])
             p2 = (point[t + 6], point[t + 7], point[t + 8])
-            GL._draw_triangle_3d(p0, p1, p2, mvp, rgb, transp)
+            GL._draw_triangle_3d(p0, p1, p2, mvp, mat, model)
 
     @staticmethod
     def viewpoint(position, orientation, fieldOfView):
@@ -401,6 +553,11 @@ class GL:
         # pois transformamos o mundo para o espaço da câmera.
         camera_matrix = GL._translation_matrix(position) @ GL._rotation_matrix(orientation)
         GL.view_matrix = np.linalg.inv(camera_matrix)
+
+        # Posição e orientação da câmera: usadas na iluminação (vetor até o
+        # olho e direção da headlight).
+        GL._eye = np.array(position, dtype=float)
+        GL._cam_rot = camera_matrix[:3, :3]
 
         # fieldOfView do X3D é o MENOR entre o campo de visão horizontal e
         # vertical. Em telas largas (aspect >= 1) ele já é o vertical (fovy);
@@ -472,23 +629,20 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        rgb, transp = GL._material(colors)
-        mvp = GL.perspective_matrix @ GL.view_matrix @ GL.transform_stack[-1]
+        mat = GL._material(colors)
+        P = np.array(point, dtype=float).reshape(-1, 3)
 
+        tris = []
         offset = 0
         for count in stripCount:
             for j in range(count - 2):
-                p0 = GL._get_point3d(point, offset + j)
-                p1 = GL._get_point3d(point, offset + j + 1)
-                p2 = GL._get_point3d(point, offset + j + 2)
+                a, b, c = offset + j, offset + j + 1, offset + j + 2
                 # Tiras de triângulo alternam a orientação dos vértices a
                 # cada triângulo para manter a face consistente (sentido
                 # horário/anti-horário) ao longo da tira.
-                if j % 2 == 0:
-                    GL._draw_triangle_3d(p0, p1, p2, mvp, rgb, transp)
-                else:
-                    GL._draw_triangle_3d(p1, p0, p2, mvp, rgb, transp)
+                tris.append((a, b, c) if j % 2 == 0 else (b, a, c))
             offset += count
+        GL._draw_indexed_mesh(P, tris, mat, smooth=GL.smooth_strips)
 
     @staticmethod
     def indexedTriangleStripSet(point, index, colors):
@@ -506,9 +660,10 @@ class GL:
         # depois 2, 3 e 4, e assim por diante. Cuidado com a orientação dos vértices, ou seja,
         # todos no sentido horário ou todos no sentido anti-horário, conforme especificado.
 
-        rgb, transp = GL._material(colors)
-        mvp = GL.perspective_matrix @ GL.view_matrix @ GL.transform_stack[-1]
+        mat = GL._material(colors)
+        P = np.array(point, dtype=float).reshape(-1, 3)
 
+        tris = []
         strip = []
         for idx in index:
             if idx == -1:
@@ -518,14 +673,10 @@ class GL:
             strip.append(idx)
             if len(strip) >= 3:
                 j = len(strip) - 3
-                p0 = GL._get_point3d(point, strip[j])
-                p1 = GL._get_point3d(point, strip[j + 1])
-                p2 = GL._get_point3d(point, strip[j + 2])
+                a, b, c = strip[j], strip[j + 1], strip[j + 2]
                 # Alterna a orientação a cada triângulo para manter a face consistente
-                if j % 2 == 0:
-                    GL._draw_triangle_3d(p0, p1, p2, mvp, rgb, transp)
-                else:
-                    GL._draw_triangle_3d(p1, p0, p2, mvp, rgb, transp)
+                tris.append((a, b, c) if j % 2 == 0 else (b, a, c))
+        GL._draw_indexed_mesh(P, tris, mat, smooth=GL.smooth_strips)
 
     @staticmethod
     def indexedFaceSet(coord, coordIndex, colorPerVertex, color, colorIndex,
@@ -552,8 +703,9 @@ class GL:
         # cor da textura conforme a posição do mapeamento. Dentro da classe GPU já está
         # implementadado um método para a leitura de imagens.
 
-        rgb, transp = GL._material(colors)
-        mvp = GL.perspective_matrix @ GL.view_matrix @ GL.transform_stack[-1]
+        mat = GL._material(colors)
+        model = GL.transform_stack[-1]
+        mvp = GL.perspective_matrix @ GL.view_matrix @ model
 
         # Textura: só usada se houver imagem e coordenadas de textura
         mipmaps = None
@@ -572,10 +724,10 @@ class GL:
             if len(face) < 3:
                 return
 
-            face_rgb = rgb
+            face_color = None  # cor única da face (0-255)
             if color and not colorPerVertex and mipmaps is None:
                 ci = colorIndex[number] if colorIndex else number
-                face_rgb = np.array(color[ci * 3:ci * 3 + 3]) * 255
+                face_color = np.array(color[ci * 3:ci * 3 + 3]) * 255
 
             verts = []
             for k, vi in enumerate(face):
@@ -590,9 +742,15 @@ class GL:
 
             for k in range(1, len(face) - 1):
                 tri = (verts[0], verts[k], verts[k + 1])
+                if face_color is not None:
+                    vcs = [face_color] * 3
+                elif per_vertex_color:
+                    vcs = [t[1] for t in tri]
+                else:
+                    vcs = None
                 GL._draw_triangle_3d(
-                    tri[0][0], tri[1][0], tri[2][0], mvp, face_rgb, transp,
-                    vcolors=[t[1] for t in tri] if per_vertex_color else None,
+                    tri[0][0], tri[1][0], tri[2][0], mvp, mat, model,
+                    vcolors=vcs,
                     uvs=[t[2] for t in tri] if mipmaps is not None else None,
                     mipmaps=mipmaps)
 
@@ -617,12 +775,26 @@ class GL:
         # essa caixa você vai provavelmente querer tesselar ela em triângulos, para isso
         # encontre os vértices e defina os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Box : size = {0}".format(size)) # imprime no terminal pontos
-        print("Box : colors = {0}".format(colors)) # imprime no terminal as cores
+        mat = GL._material(colors)
+        sx, sy, sz = size[0] / 2, size[1] / 2, size[2] / 2
 
-        # Exemplo de desenho de um pixel branco na coordenada 10, 10
-        gpu.GPU.draw_pixel([10, 10], gpu.GPU.RGB8, [255, 255, 255])  # altera pixel
+        # Cada face tem a sua normal, então os cantos são repetidos por face
+        # (6 faces x 4 cantos), cada face em 2 triângulos.
+        faces = [
+            ((0, 0, 1),  [(-sx, -sy, sz), (sx, -sy, sz), (sx, sy, sz), (-sx, sy, sz)]),
+            ((0, 0, -1), [(sx, -sy, -sz), (-sx, -sy, -sz), (-sx, sy, -sz), (sx, sy, -sz)]),
+            ((1, 0, 0),  [(sx, -sy, sz), (sx, -sy, -sz), (sx, sy, -sz), (sx, sy, sz)]),
+            ((-1, 0, 0), [(-sx, -sy, -sz), (-sx, -sy, sz), (-sx, sy, sz), (-sx, sy, -sz)]),
+            ((0, 1, 0),  [(-sx, sy, sz), (sx, sy, sz), (sx, sy, -sz), (-sx, sy, -sz)]),
+            ((0, -1, 0), [(-sx, -sy, -sz), (sx, -sy, -sz), (sx, -sy, sz), (-sx, -sy, sz)]),
+        ]
+        P, N, tris = [], [], []
+        for normal, corners in faces:
+            base = len(P)
+            P.extend(corners)
+            N.extend([normal] * 4)
+            tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
+        GL._draw_indexed_mesh(P, tris, mat, vnormals=N)
 
     @staticmethod
     def sphere(radius, colors):
@@ -634,9 +806,26 @@ class GL:
         # precisar tesselar ela em triângulos, para isso encontre os vértices e defina
         # os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Sphere : radius = {0}".format(radius)) # imprime no terminal o raio da esfera
-        print("Sphere : colors = {0}".format(colors)) # imprime no terminal as cores
+        mat = GL._material(colors)
+        stacks, slices = 20, 40  # divisões em latitude e longitude
+
+        # Pontos da esfera unitária (também são as normais) e depois escala
+        unit = []
+        for i in range(stacks + 1):
+            phi = math.pi * i / stacks  # 0 (polo norte) até pi (polo sul)
+            for j in range(slices + 1):
+                theta = 2 * math.pi * j / slices
+                unit.append((math.sin(phi) * math.cos(theta), math.cos(phi),
+                             math.sin(phi) * math.sin(theta)))
+        unit = np.array(unit)
+
+        tris = []
+        for i in range(stacks):
+            for j in range(slices):
+                a = i * (slices + 1) + j
+                b = a + slices + 1
+                tris += [(a, b, a + 1), (a + 1, b, b + 1)]
+        GL._draw_indexed_mesh(unit * radius, tris, mat, vnormals=unit)
 
     @staticmethod
     def cone(bottomRadius, height, colors):
@@ -649,10 +838,34 @@ class GL:
         # Para desenha esse cone você vai precisar tesselar ele em triângulos, para isso
         # encontre os vértices e defina os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Cone : bottomRadius = {0}".format(bottomRadius)) # imprime no terminal o raio da base do cone
-        print("Cone : height = {0}".format(height)) # imprime no terminal a altura do cone
-        print("Cone : colors = {0}".format(colors)) # imprime no terminal as cores
+        mat = GL._material(colors)
+        n = 40  # divisões ao redor do eixo Y
+        r, h = bottomRadius, height
+        apex = (0.0, h / 2, 0.0)
+
+        def ring(j):
+            t = 2 * math.pi * j / n
+            return (r * math.cos(t), -h / 2, r * math.sin(t))
+
+        def side_normal(t):
+            # normal da lateral inclinada: (h cos t, r, h sen t) normalizada
+            v = np.array([h * math.cos(t), r, h * math.sin(t)])
+            return v / np.linalg.norm(v)
+
+        # Lateral: um triângulo por divisão; o vértice do topo usa a normal do meio
+        P, N, tris = [], [], []
+        for j in range(n):
+            t0, t1 = 2 * math.pi * j / n, 2 * math.pi * (j + 1) / n
+            base = len(P)
+            P += [ring(j), ring(j + 1), apex]
+            N += [side_normal(t0), side_normal(t1), side_normal((t0 + t1) / 2)]
+            tris.append((base, base + 1, base + 2))
+        GL._draw_indexed_mesh(P, tris, mat, vnormals=N)
+
+        # Base (disco virado para baixo)
+        P = [(0.0, -h / 2, 0.0)] + [ring(j) for j in range(n)]
+        tris = [(0, 1 + j, 1 + (j + 1) % n) for j in range(n)]
+        GL._draw_indexed_mesh(P, tris, mat, vnormals=[(0, -1, 0)] * len(P))
 
     @staticmethod
     def cylinder(radius, height, colors):
@@ -665,10 +878,33 @@ class GL:
         # Para desenha esse cilindro você vai precisar tesselar ele em triângulos, para isso
         # encontre os vértices e defina os triângulos.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("Cylinder : radius = {0}".format(radius)) # imprime no terminal o raio do cilindro
-        print("Cylinder : height = {0}".format(height)) # imprime no terminal a altura do cilindro
-        print("Cylinder : colors = {0}".format(colors)) # imprime no terminal as cores
+        mat = GL._material(colors)
+        n = 40  # divisões ao redor do eixo Y
+        hh = height / 2
+
+        def circle(j, y):
+            t = 2 * math.pi * j / n
+            return (radius * math.cos(t), y, radius * math.sin(t))
+
+        def out_normal(j):
+            t = 2 * math.pi * j / n
+            return (math.cos(t), 0.0, math.sin(t))
+
+        # Lateral: dois triângulos por divisão, normais apontando para fora
+        P, N, tris = [], [], []
+        for j in range(n + 1):
+            P += [circle(j, hh), circle(j, -hh)]
+            N += [out_normal(j)] * 2
+        for j in range(n):
+            a = 2 * j
+            tris += [(a, a + 1, a + 2), (a + 2, a + 1, a + 3)]
+        GL._draw_indexed_mesh(P, tris, mat, vnormals=N)
+
+        # Tampas (topo e base): discos em leque
+        for y, ny in ((hh, 1), (-hh, -1)):
+            P = [(0.0, y, 0.0)] + [circle(j, y) for j in range(n)]
+            tris = [(0, 1 + j, 1 + (j + 1) % n) for j in range(n)]
+            GL._draw_indexed_mesh(P, tris, mat, vnormals=[(0, ny, 0)] * len(P))
 
     @staticmethod
     def navigationInfo(headlight):
@@ -680,8 +916,9 @@ class GL:
         # A luz headlight deve ser direcional, ter intensidade = 1, cor = (1 1 1),
         # ambientIntensity = 0,0 e direção = (0 0 −1).
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("NavigationInfo : headlight = {0}".format(headlight)) # imprime no terminal
+        # A headlight é uma luz direcional branca, intensidade 1, sem ambiente,
+        # que aponta para onde a câmera olha; ela é montada em _active_lights().
+        GL._headlight = bool(headlight)
 
     @staticmethod
     def directionalLight(ambientIntensity, color, intensity, direction):
@@ -693,11 +930,14 @@ class GL:
         # que emana da fonte de luz no sistema de coordenadas local. A luz é emitida ao
         # longo de raios paralelos de uma distância infinita.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("DirectionalLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("DirectionalLight : color = {0}".format(color)) # imprime no terminal
-        print("DirectionalLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("DirectionalLight : direction = {0}".format(direction)) # imprime no terminal
+        d = np.array(direction, dtype=float)
+        length = np.linalg.norm(d)
+        if length < 1e-12:
+            return
+        GL._lights.append({"type": "dir", "dir": d / length,
+                           "color": np.array(color, dtype=float),
+                           "intensity": float(intensity),
+                           "ambient": float(ambientIntensity)})
 
     @staticmethod
     def pointLight(ambientIntensity, color, intensity, location):
@@ -709,11 +949,10 @@ class GL:
         # a geometria em um raio de sua localização. O campo do raio deve ser maior ou igual a
         # zero. A iluminação do nó PointLight diminui com a distância especificada.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("PointLight : ambientIntensity = {0}".format(ambientIntensity))
-        print("PointLight : color = {0}".format(color)) # imprime no terminal
-        print("PointLight : intensity = {0}".format(intensity)) # imprime no terminal
-        print("PointLight : location = {0}".format(location)) # imprime no terminal
+        GL._lights.append({"type": "point", "loc": np.array(location, dtype=float),
+                           "color": np.array(color, dtype=float),
+                           "intensity": float(intensity),
+                           "ambient": float(ambientIntensity)})
 
     @staticmethod
     def fog(visibilityRange, color):
@@ -745,13 +984,18 @@ class GL:
 
         # Deve retornar a fração de tempo passada em fraction_changed
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("TimeSensor : cycleInterval = {0}".format(cycleInterval)) # imprime no terminal
-        print("TimeSensor : loop = {0}".format(loop))
+        # O relógio de cada sensor começa na primeira chamada, assim a animação
+        # sempre parte do primeiro quadro-chave (fração 0).
+        now = time.time()
+        start = GL._timers.setdefault((cycleInterval, loop), now)
+        elapsed = now - start
 
-        # Esse método já está implementado para os alunos como exemplo
-        epoch = time.time()  # time in seconds since the epoch as a floating point number.
-        fraction_changed = (epoch % cycleInterval) / cycleInterval
+        if cycleInterval <= 0:
+            return 0.0
+        if loop:
+            fraction_changed = (elapsed % cycleInterval) / cycleInterval
+        else:
+            fraction_changed = min(elapsed / cycleInterval, 1.0)  # roda um ciclo e para
 
         return fraction_changed
 
@@ -767,16 +1011,52 @@ class GL:
         # como fechada, com uma transições da última chave para a primeira chave. Se os keyValues
         # na primeira e na última chave não forem idênticos, o campo closed será ignorado.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("SplinePositionInterpolator : set_fraction = {0}".format(set_fraction))
-        print("SplinePositionInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("SplinePositionInterpolator : keyValue = {0}".format(keyValue))
-        print("SplinePositionInterpolator : closed = {0}".format(closed))
+        keys = np.array(key, dtype=float)
+        vals = np.array(keyValue, dtype=float).reshape(-1, 3)
+        n = len(keys)
+        if n == 0 or len(vals) != n:
+            return [0.0, 0.0, 0.0]
 
-        # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
-        value_changed = [0.0, 0.0, 0.0]
-        
-        return value_changed
+        f = float(set_fraction)
+        if n == 1 or f <= keys[0]:
+            return vals[0].tolist()
+        if f >= keys[-1]:
+            return vals[-1].tolist()
+
+        # Se closed e primeira == última chave, a curva se fecha: as tangentes
+        # das pontas consideram o vizinho do outro lado (Catmull-Rom).
+        wrap = bool(closed) and n > 2 and np.allclose(vals[0], vals[-1])
+        span = keys[-1] - keys[0]
+
+        def tangent(j):
+            """Derivada (valor por unidade de fração) na chave j."""
+            if wrap and j == 0:
+                t_prev, p_prev = keys[n - 2] - span, vals[n - 2]
+                t_next, p_next = keys[1], vals[1]
+            elif wrap and j == n - 1:
+                t_prev, p_prev = keys[n - 2], vals[n - 2]
+                t_next, p_next = keys[1] + span, vals[1]
+            else:
+                a, b = max(j - 1, 0), min(j + 1, n - 1)
+                t_prev, p_prev, t_next, p_next = keys[a], vals[a], keys[b], vals[b]
+            dt = t_next - t_prev
+            return (p_next - p_prev) / dt if dt > 1e-12 else np.zeros(3)
+
+        i = min(int(np.searchsorted(keys, f, side="right")) - 1, n - 2)
+        dt = keys[i + 1] - keys[i]
+        if dt <= 1e-12:
+            return vals[i + 1].tolist()
+        s = (f - keys[i]) / dt
+
+        # Spline cúbica de Hermite entre as chaves i e i+1
+        h00 = 2 * s ** 3 - 3 * s ** 2 + 1
+        h10 = s ** 3 - 2 * s ** 2 + s
+        h01 = -2 * s ** 3 + 3 * s ** 2
+        h11 = s ** 3 - s ** 2
+        value_changed = (h00 * vals[i] + h10 * dt * tangent(i)
+                         + h01 * vals[i + 1] + h11 * dt * tangent(i + 1))
+
+        return value_changed.tolist()
 
     @staticmethod
     def orientationInterpolator(set_fraction, key, keyValue):
@@ -793,13 +1073,49 @@ class GL:
         # zeroa a um. O campo keyValue deve conter exatamente tantas rotações 3D quanto os
         # quadros-chave no key.
 
-        # O print abaixo é só para vocês verificarem o funcionamento, DEVE SER REMOVIDO.
-        print("OrientationInterpolator : set_fraction = {0}".format(set_fraction))
-        print("OrientationInterpolator : key = {0}".format(key)) # imprime no terminal
-        print("OrientationInterpolator : keyValue = {0}".format(keyValue))
+        keys = np.array(key, dtype=float)
+        vals = np.array(keyValue, dtype=float).reshape(-1, 4)
+        n = len(keys)
+        if n == 0 or len(vals) != n:
+            return [0, 0, 1, 0]
 
-        # Abaixo está só um exemplo de como os dados podem ser calculados e transferidos
-        value_changed = [0, 0, 1, 0]
+        f = float(set_fraction)
+        if n == 1 or f <= keys[0]:
+            return vals[0].tolist()
+        if f >= keys[-1]:
+            return vals[-1].tolist()
+
+        def to_quat(r):
+            """[x, y, z, ângulo] -> quatérnio unitário (x, y, z, w)."""
+            axis = r[:3]
+            length = np.linalg.norm(axis)
+            if length < 1e-12:
+                return np.array([0.0, 0.0, 0.0, 1.0])
+            axis = axis / length
+            half = r[3] / 2
+            return np.array([*(axis * math.sin(half)), math.cos(half)])
+
+        i = min(int(np.searchsorted(keys, f, side="right")) - 1, n - 2)
+        dt = keys[i + 1] - keys[i]
+        s = (f - keys[i]) / dt if dt > 1e-12 else 1.0
+
+        q0, q1 = to_quat(vals[i]), to_quat(vals[i + 1])
+        d = float(np.dot(q0, q1))
+        if d < 0:  # q e -q são a mesma rotação; escolhe o caminho mais curto
+            q1, d = -q1, -d
+        if d > 0.9995:  # quase iguais: interpolação linear evita divisão por ~0
+            q = q0 + s * (q1 - q0)
+        else:  # SLERP: velocidade angular constante sobre a esfera unitária
+            theta = math.acos(d)
+            q = (math.sin((1 - s) * theta) * q0 + math.sin(s * theta) * q1) / math.sin(theta)
+        q = q / np.linalg.norm(q)
+
+        v = q[:3]
+        length = np.linalg.norm(v)
+        if length < 1e-9:
+            return [0, 0, 1, 0]
+        angle = 2 * math.atan2(length, q[3])
+        value_changed = [*(v / length), angle]
 
         return value_changed
 

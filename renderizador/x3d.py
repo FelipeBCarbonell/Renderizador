@@ -33,8 +33,10 @@ def get_colors(appearance):
         "shininess": 0.2,  # Valor padrão
         "transparency": 0.0,  # Valor padrão
         "ambientIntensity": 0.2,  # Valor padrão
+        "material": False,  # False = sem nó Material (não sofre iluminação)
     }
     if appearance and appearance.material:
+        colors["material"] = True
         colors["diffuseColor"] = appearance.material.diffuseColor
         colors["emissiveColor"] = appearance.material.emissiveColor
         colors["specularColor"] = appearance.material.specularColor
@@ -299,6 +301,9 @@ class Scene:
     def __init__(self, node):
         """Parse do nó X3D."""
         self.children = []
+        self.sensors = []        # TimeSensor
+        self.interpolators = []  # interpoladores de posição/orientação
+        self.routes = []         # ROUTE
         lights = []
         viewpoint = None
         navigation_info = None
@@ -311,13 +316,13 @@ class Scene:
             elif child.tag == "Shape":
                 self.children.append(Shape(child))
             elif child.tag == "TimeSensor":
-                self.children.append(TimeSensor(child))
+                self.sensors.append(TimeSensor(child))
             elif child.tag == "SplinePositionInterpolator":
-                self.children.append(SplinePositionInterpolator(child))
+                self.interpolators.append(SplinePositionInterpolator(child))
             elif child.tag == "OrientationInterpolator":
-                self.children.append(OrientationInterpolator(child))
+                self.interpolators.append(OrientationInterpolator(child))
             elif child.tag == "ROUTE":
-                self.children.append(ROUTE(child))
+                self.routes.append(ROUTE(child))
             elif child.tag == "DirectionalLight":
                 lights.append(DirectionalLight(child))
             elif child.tag == "PointLight":
@@ -346,6 +351,18 @@ class Scene:
 
     def render(self):
         """Rotina de renderização."""
+        # Propaga os eventos antes de desenhar, para a animação do quadro já
+        # usar os valores novos: sensores -> rotas -> interpoladores -> rotas
+        # (a segunda passada entrega o value_changed aos campos dos Transforms).
+        for sensor in self.sensors:
+            sensor.render()
+        for route in self.routes:
+            route.render()
+        for interpolator in self.interpolators:
+            interpolator.render()
+        for route in self.routes:
+            route.render()
+
         for child in self.children:
             child.render()
 
@@ -1152,5 +1169,7 @@ class ROUTE():
         """Rotina de renderização."""
         fromNode = X3DNode.named_nodes[self.fromNode]
         value = getattr(fromNode, self.fromField)
+        if value is None:  # origem ainda não gerou valor (interpolador não rodou)
+            return
         toNode = X3DNode.named_nodes[self.toNode]
         setattr(toNode, self.toField, value)
